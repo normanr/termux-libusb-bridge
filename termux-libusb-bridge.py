@@ -1,5 +1,6 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 
+import argparse
 import array
 import json
 import os
@@ -9,8 +10,6 @@ import socketserver
 import struct
 import subprocess
 import sys
-
-socket_name = '\x00green_green_avk.anotherterm.libusb'
 
 
 # copied directly from https://docs.python.org/3/library/socket.html#socket.socket.sendmsg
@@ -43,7 +42,7 @@ def get_devices():
 def open_device(path: os.PathLike):
   s1, s2 = socket.socketpair(socket.AF_UNIX)
   pair_fd = s1.fileno()
-  callback = [sys.executable, __file__, str(pair_fd)]
+  callback = [sys.executable, __file__, '--fds', str(pair_fd)]
   args = ['termux-usb', '-r', '-e', shlex.join(callback), path]
   p = subprocess.run(args, pass_fds=[pair_fd])
   if p.returncode != 0:
@@ -77,8 +76,11 @@ class RequestHandler(socketserver.StreamRequestHandler):
     self.wfile.write(struct.pack('!H', len(data)) + data)
 
   def handle(self):
-    # self.client_address, self.request, self.server
-    # TODO: check peer credentials uid == myuid
+    creds = self.request.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                                    struct.calcsize('3i'))
+    pid, uid, gid = struct.unpack('3i', creds)
+    if os.getuid() != uid:
+      raise OSError('Spoofing detected!')
     s = self.read_str()
     if s is None:
       return
@@ -96,20 +98,30 @@ class RequestHandler(socketserver.StreamRequestHandler):
     self.read_str()  # Wait for closing by the client...
 
 
-class ThreadingUnixStreamServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+class ThreadingUnixStreamServer(socketserver.ThreadingMixIn,
+                                socketserver.UnixStreamServer):
   pass
 
 
 def main(args):
-  if len(args) == 2:
-    s = socket.fromfd(int(sys.argv[1]), socket.AF_UNIX, socket.SOCK_STREAM)
-    r = send_fds(s, b'@', [int(sys.argv[2])])
+  if args.fds:
+    s = socket.fromfd(args.fds[0], socket.AF_UNIX, socket.SOCK_STREAM)
+    r = send_fds(s, b'@', [args.fds[1]])
     if r != 1:
       return 1
     return 0
-  srv = ThreadingUnixStreamServer(socket_name, RequestHandler)
+  srv = ThreadingUnixStreamServer('\x00' + args.socket_name, RequestHandler)
   srv.serve_forever()
 
 
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    '-s',
+    '--socket_name',
+    default='green_green_avk.anotherterm.libusb',
+    help=('abstract unix socket name of the service to bridge to termux '
+          '(default: green_green_avk.anotherterm.libusb)'))
+parser.add_argument('--fds', nargs=2, type=int, help=argparse.SUPPRESS)
+
 if __name__ == '__main__':
-  exit(main(sys.argv[1:]))
+  exit(main(parser.parse_args()))
