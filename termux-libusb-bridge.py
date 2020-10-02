@@ -2,6 +2,7 @@
 
 import argparse
 import array
+import dataclasses
 import json
 import os
 import shlex
@@ -10,6 +11,9 @@ import socketserver
 import struct
 import subprocess
 import sys
+import threading
+import time
+import traceback
 
 
 # copied directly from https://docs.python.org/3/library/socket.html#socket.socket.sendmsg
@@ -31,7 +35,7 @@ def recv_fds(sock, msglen, maxfds):
   return msg, list(fds)
 
 
-def get_devices():
+def list_devices():
   args = ['termux-usb', '-l']
   p = subprocess.run(args, capture_output=True)
   return json.loads(p.stdout)
@@ -43,7 +47,7 @@ def open_device(path: os.PathLike):
   s1, s2 = socket.socketpair(socket.AF_UNIX)
   pair_fd = s1.fileno()
   callback = [sys.executable, __file__, '--fds', str(pair_fd)]
-  args = ['termux-usb', '-r', '-e', shlex.join(callback), path]
+  args = ['termux-usb', '-r', '-e', shlex.join(callback), os.fspath(path)]
   p = subprocess.run(args, pass_fds=[pair_fd])
   if p.returncode != 0:
     return None
@@ -85,22 +89,98 @@ class RequestHandler(socketserver.StreamRequestHandler):
     if s is None:
       return
     if not s:
-      for d in get_devices():
+      for d in self.server.get_devices():
         self.write_str(d)
       self.write_str('')
       return
 
-    fd = open_device(s)
+    fd = self.server.get_device(s)
     if fd is None:
       return
     r = send_fds(self.request, b'\x00', [fd])
-    os.close(fd)
-    self.read_str()  # Wait for closing by the client...
+    try:
+      self.read_str()  # Wait for closing by the client...
+    except Exception:
+      pass
 
 
 class ThreadingUnixStreamServer(socketserver.ThreadingMixIn,
                                 socketserver.UnixStreamServer):
   pass
+
+
+@dataclasses.dataclass
+class FlushingCacheEntry:
+  value: ...
+  atime: float
+
+
+class FlushingCache:
+
+  def __init__(self, max_age, expire_callback):
+    self.max_age = max_age
+    self.expire_callback = expire_callback
+    self.lock = threading.Lock()
+    self.items = dict()  # type: Dict[str, FlushingCacheEntry]
+    self.flush_thread = threading.Thread(target=self.flusher)
+    self.flush_thread.start()
+
+  def get(self, key, default):
+    with self.lock:
+      if key not in self.items:
+        return default
+      entry = self.items[key]
+      # print('get', key, entry)
+      entry.atime = time.time()
+      return entry.value
+
+  def __setitem__(self, key, value):
+    self.items[key] = FlushingCacheEntry(value, time.time())
+
+  def flusher(self):
+    while True:
+      expired = []
+      deadline = time.time() - self.max_age
+      # print('check', deadline)
+      with self.lock:
+        for key, entry in list(self.items.items()):
+          if entry.atime < deadline:
+            # print('flush', deadline, key, entry)
+            del self.items[key]
+            expired.append((key, entry.value))
+      for key, value in expired:
+        try:
+          self.expire_callback(key, value)
+        except Exception as e:
+          traceback.print_exc()
+      time.sleep(self.max_age / 5)
+
+
+class Server(ThreadingUnixStreamServer):
+
+  def __init__(self, server_address):
+    super().__init__(server_address, RequestHandler)
+    self.device_cache = FlushingCache(3, self.entry_expired)
+
+  def get_devices(self):
+    devices = self.device_cache.get(None, None)
+    if devices is None:
+      devices = list_devices()
+    self.device_cache[None] = devices
+    return devices
+
+  def get_device(self, path: os.PathLike):
+    fspath = os.fspath(path)
+    fd = self.device_cache.get(fspath, None)
+    if fd is None:
+      fd = open_device(path)
+      if fd:
+        self.device_cache[fspath] = fd
+    return fd
+
+  def entry_expired(self, key, value):
+    if key:
+      os.close(value)
 
 
 def main(args):
@@ -110,7 +190,7 @@ def main(args):
     if r != 1:
       return 1
     return 0
-  srv = ThreadingUnixStreamServer('\x00' + args.socket_name, RequestHandler)
+  srv = Server('\x00' + args.socket_name)
   srv.serve_forever()
 
 
